@@ -56,8 +56,9 @@ def get_args():
     parser.add_argument('-w', '--load_weights', type=str, default=None,
                         help='whether to load weights from a checkpoint, set None to initialize, set \'last\' to load last checkpoint')
     parser.add_argument('--saved_path', type=str, default='logs/')
-    parser.add_argument('--debug', type=boolean_string, default=False, help='whether visualize the predicted boxes of trainging, '
-                                                                  'the output images will be in test/')
+    parser.add_argument('--debug', type=boolean_string, default=False,
+                        help='whether visualize the predicted boxes of trainging, '
+                             'the output images will be in test/')
 
     args = parser.parse_args()
     return args
@@ -128,7 +129,7 @@ def train(opt):
 
     model = EfficientDetBackbone(num_classes=len(params.obj_list), compound_coef=opt.compound_coef,
                                  ratios=eval(params.anchors_ratios), scales=eval(params.anchors_scales))
-
+    dev_sample_path = get_dev_file()
     # load last weights
     if opt.load_weights is not None:
         if opt.load_weights.endswith('.pth'):
@@ -181,6 +182,7 @@ def train(opt):
     writer = SummaryWriter(opt.log_path + f'/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}/')
 
     # warp the model with loss function, to reduce the memory usage on gpu0 and speedup
+    raw_model=model
     model = ModelWithLoss(model, debug=opt.debug)
 
     if params.num_gpus > 0:
@@ -258,6 +260,7 @@ def train(opt):
 
                     if step % opt.save_interval == 0 and step > 0:
                         save_checkpoint(model, f'efficientdet-d{opt.compound_coef}_{epoch}_{step}.pth')
+                        test_sample(raw_model, dev_sample_path, opt.compound_coef)
                         print('checkpoint...')
 
                 except Exception as e:
@@ -308,7 +311,7 @@ def train(opt):
                     save_checkpoint(model, f'efficientdet-d{opt.compound_coef}_{epoch}_{step}.pth')
 
                 model.train()
-                           
+
                 # Early stopping
                 if epoch - best_epoch > opt.es_patience > 0:
                     print('[Info] Stop training at epoch {}. The lowest loss achieved is {}'.format(epoch, best_loss))
@@ -324,6 +327,107 @@ def save_checkpoint(model, name):
         torch.save(model.module.model.state_dict(), os.path.join(opt.saved_path, name))
     else:
         torch.save(model.model.state_dict(), os.path.join(opt.saved_path, name))
+
+
+def get_dev_file():
+    filenames = []
+    batch_size = 5
+    img_path = []
+    for root, dirs, files in os.walk('/content/Yet-Another-EfficientDet-Pytorch/datasets/global-wheat-detection/val'):
+        batch_img_path = []
+        batch_filenames = []
+        for filename in files:
+            batch_img_path.append(root + '/' + filename)
+            batch_filenames.append(filename)
+            if len(batch_filenames) == batch_size:
+                img_path.append({
+                    'path': batch_img_path,
+                    'name': batch_filenames
+                })
+                batch_img_path = []
+                batch_filenames = []
+            if len(img_path) > 10:
+                break
+    return img_path
+
+
+import torch
+from torch.backends import cudnn
+
+from backbone import EfficientDetBackbone
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+from efficientdet.utils import BBoxTransform, ClipBoxes
+from utils.utils import preprocess, invert_affine, postprocess
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def test_sample(model, img_path, compound_coef):
+    force_input_size = None
+    threshold = 0.4
+    iou_threshold = 0.4
+
+    use_cuda = True
+    use_float16 = False
+    cudnn.fastest = True
+    cudnn.benchmark = True
+
+    obj_list = ['machine', 'color', 'anthrax', 'stick', 'spot']
+
+    input_sizes = [512, 640, 768, 896, 1024, 1280, 1280, 1536]
+    input_size = input_sizes[compound_coef] if force_input_size is None else force_input_size
+
+    model.requires_grad_(False)
+    model.eval()
+
+    for batch_i in range(len(img_path)):
+
+        ori_imgs, framed_imgs, framed_metas = preprocess(img_path[batch_i]['path'], max_size=input_size)
+
+        if use_cuda:
+            x = torch.stack([torch.from_numpy(fi).cuda() for fi in framed_imgs], 0)
+        else:
+            x = torch.stack([torch.from_numpy(fi) for fi in framed_imgs], 0)
+
+        x = x.to(torch.float32 if not use_float16 else torch.float16).permute(0, 3, 1, 2)
+
+        with torch.no_grad():
+            features, regression, classification, anchors = model(x)
+
+            regressBoxes = BBoxTransform()
+            clipBoxes = ClipBoxes()
+
+            out = postprocess(x,
+                              anchors, regression, classification,
+                              regressBoxes, clipBoxes,
+                              threshold, iou_threshold)
+
+        out = invert_affine(framed_metas, out)
+        plt.figure(figsize=(20, 20))
+
+        for i in range(len(img_path[batch_i]['name'])):
+
+            if len(out[i]['rois']) == 0:
+                continue
+
+            for j in range(len(out[i]['rois'])):
+                (x1, y1, x2, y2) = out[i]['rois'][j].astype(np.int)
+                cv2.rectangle(ori_imgs[i], (x1, y1), (x2, y2), (255, 255, 0), 2)
+                obj = obj_list[out[i]['class_ids'][j]]
+                score = float(out[i]['scores'][j])
+
+                cv2.putText(ori_imgs[i], '{}, {:.3f}'.format(obj, score),
+                            (x1, y1 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 0), 1)
+                # output.append({"image_id": os.path.splitext(img_path[batch_i]['name'][i])[0],
+                #                "PredictionString": "{:.1f} {} {} {} {}".format(score, x1, y1, x2 - x1, y2 - y1)})
+            plt.imsave('./test/' + img_path[batch_i]['name'][i], ori_imgs[i])
+    # pd.DataFrame(output).to_csv('output.csv')
+    model.requires_grad_(True)
+    model.train()
 
 
 if __name__ == '__main__':
