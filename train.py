@@ -260,7 +260,7 @@ def train(opt):
 
                     if step % opt.save_interval == 0 and step > 0:
                         save_checkpoint(model, f'efficientdet-d{opt.compound_coef}_{epoch}_{step}.pth')
-                        test_sample(raw_model, dev_sample_path, opt.compound_coef)
+                        # test_sample(raw_model, dev_sample_path, opt.compound_coef)
                         print('checkpoint...')
 
                 except Exception as e:
